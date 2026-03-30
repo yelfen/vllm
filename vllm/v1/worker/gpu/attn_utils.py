@@ -9,10 +9,12 @@ import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend, CommonAttentionMetadata
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
@@ -112,45 +114,80 @@ def _reshape_kv_cache(
     kv_cache_raw_tensors: dict[str, torch.Tensor],
     attn_backends: dict[str, AttentionBackend],
     cache_dtype: str,
-) -> dict[str, torch.Tensor]:
-    kv_caches: dict[str, torch.Tensor] = {}
+) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+    kv_caches: dict[str, torch.Tensor | list[torch.Tensor]] = {}
     for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
         for layer_name in kv_cache_group_spec.layer_names:
             kv_cache_spec = kv_cache_group_spec.kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[layer_name]
-            assert isinstance(kv_cache_spec, AttentionSpec)
 
             raw_tensor = kv_cache_raw_tensors[layer_name]
             assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
             num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
 
-            attn_backend = attn_backends[layer_name]
-            kv_cache_shape = attn_backend.get_kv_cache_shape(
-                num_blocks,
-                kv_cache_spec.block_size,
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
-                cache_dtype,
-            )
+            if isinstance(kv_cache_spec, AttentionSpec):
+                attn_backend = attn_backends[layer_name]
+                kv_cache_shape = attn_backend.get_kv_cache_shape(
+                    num_blocks,
+                    kv_cache_spec.block_size,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                    cache_dtype,
+                )
 
-            # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
-            try:
-                kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                assert len(kv_cache_stride_order) == len(kv_cache_shape)
-            except (AttributeError, NotImplementedError):
-                kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                # FIXME(woosuk): Add kv_cache_stride_order to all backends.
+                try:
+                    kv_cache_stride_order = (
+                        attn_backend.get_kv_cache_stride_order()
+                    )
+                    assert len(kv_cache_stride_order) == len(kv_cache_shape)
+                except (AttributeError, NotImplementedError):
+                    kv_cache_stride_order = tuple(
+                        range(len(kv_cache_shape))
+                    )
 
-            kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
-            inv_order = [
-                kv_cache_stride_order.index(i)
-                for i in range(len(kv_cache_stride_order))
-            ]
+                kv_cache_shape = tuple(
+                    kv_cache_shape[i] for i in kv_cache_stride_order
+                )
+                inv_order = [
+                    kv_cache_stride_order.index(i)
+                    for i in range(len(kv_cache_stride_order))
+                ]
 
-            dtype = kv_cache_spec.dtype
-            raw_tensor = raw_tensor.view(dtype)
-            raw_tensor = raw_tensor.view(kv_cache_shape)
-            kv_caches[layer_name] = raw_tensor.permute(*inv_order)
+                dtype = kv_cache_spec.dtype
+                raw_tensor = raw_tensor.view(dtype)
+                raw_tensor = raw_tensor.view(kv_cache_shape)
+                kv_caches[layer_name] = raw_tensor.permute(*inv_order)
+
+            elif isinstance(kv_cache_spec, MambaSpec):
+                state_tensors: list[torch.Tensor] = []
+                storage_offset_bytes = 0
+                for shape, dtype in zip(
+                    kv_cache_spec.shapes, kv_cache_spec.dtypes
+                ):
+                    dtype_size = get_dtype_size(dtype)
+                    num_element_per_page = (
+                        kv_cache_spec.page_size_bytes // dtype_size
+                    )
+                    target_shape = (num_blocks, *shape)
+                    stride = torch.empty(target_shape).stride()
+                    target_stride = (num_element_per_page, *stride[1:])
+                    assert storage_offset_bytes % dtype_size == 0
+                    tensor = torch.as_strided(
+                        raw_tensor.view(dtype),
+                        size=target_shape,
+                        stride=target_stride,
+                        storage_offset=storage_offset_bytes // dtype_size,
+                    )
+                    state_tensors.append(tensor)
+                    storage_offset_bytes += stride[0] * dtype_size
+                kv_caches[layer_name] = state_tensors
+
+            else:
+                raise NotImplementedError(
+                    f"Unsupported KV cache spec: {type(kv_cache_spec)}"
+                )
     return kv_caches
 
 
@@ -161,7 +198,7 @@ def init_kv_cache(
     attn_backends: dict[str, AttentionBackend],
     device: torch.device,
     cache_dtype: str,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     kv_cache_raw_tensors = _allocate_kv_cache(kv_cache_config, device)
     kv_caches = _reshape_kv_cache(
         kv_cache_config, kv_cache_raw_tensors, attn_backends, cache_dtype
