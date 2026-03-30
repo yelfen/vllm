@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -1294,14 +1295,27 @@ def _report_kv_cache_config(
         vllm_config: The global VllmConfig
         kv_cache_config: The resolved KV cache configuration
     """
-    min_block_size = min(
-        [group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups]
-    )
+    # For hybrid Mamba+attention models, only count attention groups for
+    # token capacity since Mamba layers store O(1) state, not per-token KV.
+    attn_groups = [
+        g
+        for g in kv_cache_config.kv_cache_groups
+        if not isinstance(g.kv_cache_spec, MambaSpec)
+    ]
+    if attn_groups:
+        num_attn_groups = len(attn_groups)
+        min_block_size = min(g.kv_cache_spec.block_size for g in attn_groups)
+    else:
+        num_attn_groups = len(kv_cache_config.kv_cache_groups)
+        min_block_size = min(
+            g.kv_cache_spec.block_size
+            for g in kv_cache_config.kv_cache_groups
+        )
 
     # Log the KV cache size and maximum concurrency.
     num_tokens = (
         kv_cache_config.num_blocks
-        // len(kv_cache_config.kv_cache_groups)
+        // num_attn_groups
         * min_block_size
     )
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
